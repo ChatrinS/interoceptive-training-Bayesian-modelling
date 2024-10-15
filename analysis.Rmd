@@ -1,0 +1,2639 @@
+---
+title: "analysis"
+author: "Chatrin Suksasilp"
+date: "2024-09-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+
+library(ggplot2)
+library(GGally)
+library(CCA)
+library(optLog)
+library(tidyverse)
+library(emmeans)
+library(mediation)
+library(car)
+library(easystats)
+
+library(lme4)
+library(lmerTest)
+
+library(glmnet)
+```
+
+#Load in data
+```{r}
+df <- read.csv("data/data.csv")
+
+# Concatenated data parameter estimates
+params_df <- read_csv("results/model_fits/IP1_IP2_pS/combine_fits.csv")
+params_df$Group <- "training"
+params_df$Var1 <- gsub("\\.out", "", params_df$Var1)
+
+control_all <- read.csv("results/model_fits_assessment/IP1_IP2_pS/control/all/combine_fits.csv")
+control_all$Group <- "control"
+control_all$Var1 <- gsub("\\.out", "", control_all$Var1)
+
+# Derived delta IP2 estimates
+end_precision_training <- read_csv("results/end_precision_TRAINING.csv")
+end_precision_training$IP2_change <- end_precision_training$IP2_end - end_precision_training$IP2
+end_precision_training$Group <- "training"
+
+end_precision_control <- read_csv("results/end_precision_CONTROL.csv")
+end_precision_control$IP2_change <- end_precision_control$IP2_end - end_precision_control$IP2
+end_precision_control$Group <- "control"
+
+# Assessment session parameter estimates
+training_B <- read.csv("results/model_fits_assessment/IP1_IP2_pS/training/bl/combine_fits.csv")
+training_M <- read.csv("results/model_fits_assessment/IP1_IP2_pS/training/MA/combine_fits.csv")
+training_F <- read.csv("results/model_fits_assessment/IP1_IP2_pS/training/exit/combine_fits.csv")
+
+control_B <- read.csv("results/model_fits_assessment/IP1_IP2_pS/control/bl/combine_fits.csv")
+control_M <- read.csv("results/model_fits_assessment/IP1_IP2_pS/control/MA/combine_fits.csv")
+control_F <- read.csv("results/model_fits_assessment/IP1_IP2_pS/control/exit/combine_fits.csv")
+
+```
+
+## Preprocess dataframes
+### MAIA Trusting FL: rectify raw scores which were incorrectly coded
+```{r}
+# Divide all scores above maximum by 3 (number of items in Trusting sub-scale)
+df$trustingFL[df$trustingFL > 5.00] <- df$trustingFL[df$trustingFL > 5.00] / 3
+
+# Re-calculate the change score
+df$Change_MAIA_Trusting_FLmBL <- df$trustingFL - df$trustingBL
+
+# Save useful column names
+MAIA_BL_cols <- c('NoticingBL', 'not_distractingBL', 'not_worryingBL', 'attention_regulationBL','emotional_awarenessBL', 'self_regulationBL', 'body_listeningBL', 'trustingBL')
+MAIA_FL_cols <- c('NoticingFL','not_distractingFL','not_worryingFL','attention_regulationFL','emotional_awarenessFL','self_regulationFL','body_listeningFL','trustingFL')
+
+# Re-calculate the average BL, FL, and change scores
+df$MAIA_average_BL <- df[MAIA_BL_cols] %>% rowMeans()
+df$MAIA_average_F <- df[MAIA_FL_cols] %>% rowMeans()
+df$MAIA_average_change <- df$MAIA_average_F - df$MAIA_average_BL
+```
+
+### Harmonise subject identifiers
+```{r}
+
+# Append 'C' to participant numbers in control group
+df$Participant <- ifelse(df$Condition == "control", paste0(df$Participant, "C"), df$Participant)
+
+# Training group
+update_participant_column <- function(df) {
+  
+  # Rename participant column if needed
+  colnames(df)[colnames(df) == "Var1"] <- "Participant"
+  
+  df$Participant <- sub("^sub", "", df$Participant) %>%
+                      str_replace("^0+", "")
+  df <- df[, !(names(df) %in% c("F"))]
+  return(df)
+}
+
+params_df <- update_participant_column(params_df)
+training_B <- update_participant_column(training_B)
+training_M <- update_participant_column(training_M)
+training_F <- update_participant_column(training_F)
+end_precision_training <- update_participant_column(end_precision_training)
+
+# Control group
+update_participant_column <- function(df) {
+  
+  # Rename participant column if needed
+  colnames(df)[colnames(df) == "Var1"] <- "Participant"
+  
+  df$Participant <- sub("^sub", "", df$Participant) %>%
+                      str_replace("^0+", "") %>%
+                      str_c("C")
+  df <- df[, !(names(df) %in% c("F"))]
+  return(df)
+}
+
+control_all <- update_participant_column(control_all)
+control_B <- update_participant_column(control_B)
+control_M <- update_participant_column(control_M)
+control_F <- update_participant_column(control_F)
+end_precision_control <- update_participant_column(end_precision_control)
+  
+```
+
+## Make a training + control combined dataframe
+```{r}
+
+# Merge delta IP2 values
+params_df <- merge(params_df, end_precision_training[, c("Participant", "IP2_change")], by = "Participant", all.x = TRUE)
+control_all <- merge(control_all, end_precision_control[, c("Participant", "IP2_change")], by = "Participant", all.x = TRUE)
+
+combined_df <- rbind(params_df, control_all)
+# combined_df$Group <- ifelse(grepl("C", combined_df$Participant), "control", "training")
+```
+
+
+## Define function to log-transform non-normal variables - used in subsequent analysis
+```{r}
+library(optLog)
+
+# Save useful column names
+#outcome_vars <- c("IP1", "IP2", "pS")
+#columns_to_transform <- c("IP1", "IP2", "pS")
+param_cols <- c("IP1", "IP2", "pS")
+
+# Can be changed to power transform if preferred
+applyOptLogTransform <- function(dataframe, columns) {
+  transformed_data <- optLogTransform(data.matrix(dataframe[, columns]), type = "log", scaled = FALSE, skew_thresh = .5)
+  
+  for (i in seq_along(columns)) {
+    dataframe[, columns[i]] <- transformed_data$data[, i]
+    hist(transformed_data$data[, i])
+  }
+  
+  return(dataframe)
+}
+
+```
+
+
+```{r Import heart rate measures}
+library(dplyr)
+
+import_HR <- function(directory_path) {
+  # Get a list of all CSV files in the directory
+  csv_files <- list.files(directory_path, pattern = "\\.csv$", full.names = TRUE)
+
+  # Create an empty dataframe to store the results
+  HR_df <- data.frame(Participant = character(), mean_heartRate = numeric(), mean_heartRateSD = numeric(), stringsAsFactors = FALSE)
+
+  # Loop through each CSV file
+  for (file in csv_files) {
+    # Read the CSV file into a dataframe
+    temp_df <- read.csv(file)
+
+    # Calculate the mean of the heartRate column
+    mean_hr <- mean(temp_df$heartRate, na.rm = TRUE)
+
+    # Calculate the mean of the heartRateSD column
+    mean_hr_sd <- mean(temp_df$heartRateSD, na.rm = TRUE)
+
+    # Get the Participant value from the first cell of the Participant column
+    participant_value <- temp_df$Participant[1]
+
+    # Create a new row for HR_df
+    new_row <- data.frame(Participant = participant_value, mean_heartRate = mean_hr, mean_heartRateSD = mean_hr_sd, stringsAsFactors = FALSE)
+
+    # Append the new row to HR_df
+    HR_df <- bind_rows(HR_df, new_row)
+  }
+
+  # Return the resulting dataframe
+  return(HR_df)
+}
+
+# Import heartrate data, harmonise subject IDs
+training_HR <- import_HR("data/processed")
+training_HR$Participant <- sub("sub", "", training_HR$Participant)
+training_HR$Participant <- gsub("^0", "", training_HR$Participant)
+
+control_HR <- import_HR("data/assessment/control")
+control_HR$Participant <- sub("sub", "", control_HR$Participant)
+control_HR$Participant <- sub("sub", "", control_HR$Participant)
+control_HR$Participant <- gsub("^0", "", control_HR$Participant)
+
+combined_HR <- rbind(training_HR,control_HR)
+
+combined_HR
+```
+
+# Placeholder - run all chunks above here to prepare data
+```{r}
+```
+
+# Computational Modelling
+
+## Computational parameter estimates
+
+```{r Parameter estimates normal distribution tests}
+
+# In training group only
+shapiro.test(params_df$IP1)
+shapiro.test(params_df$IP2)
+shapiro.test(params_df$pS)
+shapiro.test(end_precision_training$IP2_change)
+
+# In control group only
+shapiro.test(control_all$IP1)
+shapiro.test(control_all$IP2)
+shapiro.test(control_all$pS)
+shapiro.test(end_precision_control$IP2_change)
+
+# Both groups pooled
+shapiro.test(combined_df$IP1)
+shapiro.test(combined_df$IP2)
+shapiro.test(combined_df$pS)
+shapiro.test(combined_df$IP2_change)
+
+```
+
+```{r Figure 3}
+
+library(GGally)
+
+temp_df <- combined_df[combined_df$Group == "training", c("IP1", "IP2", "pS", "IP2_change")]
+
+GGally::ggpairs(data = temp_df, 
+                upper = list(continuous = GGally::wrap(ggally_cor, stars = F)),
+                columnLabels = c("IP1","IP2","pS","delta_IP2"))
+
+```
+
+```{r Figure 4}
+
+library(GGally)
+
+temp_df <- combined_df[combined_df$Group == "control", c("IP1", "IP2", "pS", "IP2_change")]
+
+GGally::ggpairs(data = temp_df, 
+                upper = list(continuous = GGally::wrap(ggally_cor, stars = F)),
+                columnLabels = c("IP1","IP2","pS","delta_IP2"))
+
+```
+
+## Relationship with heartrate and conventional interoceptive task measures 
+
+```{r Import heart rate measures}
+temp_df <- merge(combined_df, combined_HR, by = "Participant", all.x = TRUE)
+temp_df <- merge(temp_df, df[, c('Participant','Age', 'Sex')], by = "Participant", all.x = TRUE)
+
+# temp_df <- temp_df %>% filter(Group == "training") 
+
+temp_df
+
+shapiro.test(temp_df$mean_heartRate)
+shapiro.test(temp_df$mean_heartRateSD)
+shapiro.test(temp_df$IP1)
+shapiro.test(temp_df$IP2)
+shapiro.test(temp_df$pS)
+
+
+# temp_df[c("Participant","mean_heartRate")]
+
+cor.test(temp_df$IP1, temp_df$mean_heartRate, method = "pearson")
+cor.test(temp_df$IP1, temp_df$mean_heartRate, method = "spearman")
+
+plot(temp_df$IP1, temp_df$mean_heartRate)
+
+```
+
+```{r Multiple regression to predict IP1 in both groups pooled (supplementary 2.1)}
+
+model <- lm(formula = IP1 ~ mean_heartRate + mean_heartRateSD + IP2 + pS + Age + Sex, 
+               data    = temp_df)
+
+library(jtools)
+summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE, digits = 3)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+```
+```{r Multiple regression to predict IP1 in training group only (supplementary 2.2)}
+
+temp_df <- temp_df %>% filter(Group == "training")
+
+model <- lm(formula = IP1 ~ mean_heartRate + mean_heartRateSD + IP2 + pS + Age + Sex, 
+               data    = temp_df)
+
+library(jtools)
+summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE, digits = 3)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+
+```
+
+
+```{r Change in heartbeat tracking task accuracy}
+# Select subset of columns
+temp_df <- df[,c('Condition', 'Participant', 'Age', 'Sex', 'HBT_BL', 'HBT_Mid', 'HBT_FL')]
+# Cvalue_BL, Cvalue_ML, Cvalue_F, HBT_BL, HBT_Mid, HBT_FL
+
+# Convert to long form
+long_df <- pivot_longer(temp_df, cols = starts_with("HBT"), names_to = "Time", values_to = "HBT")
+
+# Rename timepoint names 
+long_df <- long_df %>%
+  mutate(Time = case_when(
+    Time == "HBT_BL" ~ "baseline",
+    Time == "HBT_Mid" ~ "midpoint",
+    Time == "HBT_FL" ~ "final",
+    TRUE ~ Time  # Keep other values unchanged
+  ))
+
+# Rename 'Condition' column to 'Group'
+names(long_df)[names(long_df) == "Condition"] <- "Group"
+
+# Recode group here: control = -1, training = 1
+long_df$Group <- ifelse(long_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+long_df$Sex <- ifelse(long_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+long_df[, "Age"] <- scale(long_df[, "Age"], center = TRUE, scale = FALSE)
+
+long_df
+
+library(lmerTest)
+
+model <- lmer(formula = HBT ~ Group * Time + Age + Sex + (1 | Participant), 
+               data    = long_df)
+
+library(jtools)
+summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  Time|Group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+
+```
+
+```{r Change in heartbeat discrimination task d’ }
+# Select subset of columns
+temp_df <- df[,c('Condition', 'Participant', 'Age', 'Sex', 'Dprime_BL', 'Dprime_ML', 'Dprime_F')]
+
+# Convert to long form
+long_df <- pivot_longer(temp_df, cols = starts_with("Dprime"), names_to = "Time", values_to = "Dprime")
+
+# Rename timepoint names 
+long_df <- long_df %>%
+  mutate(Time = case_when(
+    Time == "Dprime_BL" ~ "baseline",
+    Time == "Dprime_ML" ~ "midpoint",
+    Time == "Dprime_F" ~ "final",
+    TRUE ~ Time  # Keep other values unchanged
+  ))
+
+# Rename 'Condition' column to 'Group'
+names(long_df)[names(long_df) == "Condition"] <- "Group"
+
+# Recode group here: control = -1, training = 1
+long_df$Group <- ifelse(long_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+long_df$Sex <- ifelse(long_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+long_df[, "Age"] <- scale(long_df[, "Age"], center = TRUE, scale = FALSE)
+
+long_df
+
+library(lmerTest)
+
+model <- lmer(formula = Dprime ~ Group * Time + Age + Sex + (1 | Participant), 
+               data    = long_df)
+
+library(jtools)
+# summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  Time|Group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+
+```
+
+```{r Change in heartbeat discrimination task C (Supplementary 3.3)}
+# Select subset of columns
+temp_df <- df[,c('Condition', 'Participant', 'Age', 'Sex', 'Cvalue_BL', 'Cvalue_ML', 'Cvalue_F')]
+
+# Convert to long form
+long_df <- pivot_longer(temp_df, cols = starts_with("Cvalue"), names_to = "Time", values_to = "Cvalue")
+
+# Rename timepoint names 
+long_df <- long_df %>%
+  mutate(Time = case_when(
+    Time == "Cvalue_BL" ~ "baseline",
+    Time == "Cvalue_ML" ~ "midpoint",
+    Time == "Cvalue_F" ~ "final",
+    TRUE ~ Time  # Keep other values unchanged
+  ))
+
+# Rename 'Condition' column to 'Group'
+names(long_df)[names(long_df) == "Condition"] <- "Group"
+
+# Recode group here: control = -1, training = 1
+long_df$Group <- ifelse(long_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+long_df$Sex <- ifelse(long_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+long_df[, "Age"] <- scale(long_df[, "Age"], center = TRUE, scale = FALSE)
+
+long_df
+
+library(lmerTest)
+
+model <- lmer(formula = Cvalue ~ Group * Time + Age + Sex + (1 + Group | Participant), 
+               data    = long_df)
+library(jtools)
+# summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  Time|Group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+
+```
+
+
+## Relationships between model parameters and task behaviour.
+
+```{r Correlations between parameters and change in signal detection d' (training group only)}
+
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE) %>% 
+  filter(Group == "training")
+# temp_df
+
+# delta IP2 and change in d'
+cor.test(temp_df$IP2_change, (temp_df$Dprime_F - temp_df$Dprime_BL), method = "spearman")
+
+# IP1 and change in d'
+cor.test(temp_df$IP1, (temp_df$Dprime_F - temp_df$Dprime_BL), method = "pearson")
+
+# IP1 and delta IP2
+cor.test(temp_df$IP2_change, temp_df$IP1, method = "spearman")
+
+```
+
+```{r Correlations between parameters and change in signal detection d' (both groups pooled)}
+
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE)
+# temp_df
+
+# delta IP2 and change in d'
+cor.test(temp_df$IP2_change, (temp_df$Dprime_F - temp_df$Dprime_BL), method = "spearman")
+
+# IP1 and change in d'
+cor.test(temp_df$IP1, (temp_df$Dprime_F - temp_df$Dprime_BL), method = "pearson")
+
+# IP1 and delta IP2
+cor.test(temp_df$IP2_change, temp_df$IP1, method = "spearman")
+
+```
+
+```{r Mediation analysis (training group only)}
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE) %>% 
+  filter(Group == "training")
+
+mediation_df <- temp_df[c(param_cols, "IP2_change", "Dprime_BL", "Dprime_F")] %>% na.omit()
+mediation_df$Dprime_change <- mediation_df$Dprime_F - mediation_df$Dprime_BL
+mediation_df
+
+mod1 <- lm(Dprime_change ~ IP1, data = mediation_df)
+mod2 <- lm(IP2_change ~ IP1, data = mediation_df)
+mod3 <- lm(Dprime_change ~ IP2_change + IP1, data = mediation_df)
+
+set.seed(1)
+med <- mediation::mediate(model.m = mod2, model.y = mod3, sims = 2000, boot = TRUE, boot.ci.type = "bca", treat = "IP1", mediator = "IP2_change")
+summary(med)
+```
+
+```{r Mediation analysis (both groups pooled)}
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE)
+
+mediation_df <- temp_df[c(param_cols, "IP2_change", "Dprime_BL", "Dprime_F")] %>% na.omit()
+mediation_df$Dprime_change <- mediation_df$Dprime_F - mediation_df$Dprime_BL
+mediation_df
+
+mod1 <- lm(Dprime_change ~ IP1, data = mediation_df)
+mod2 <- lm(IP2_change ~ IP1, data = mediation_df)
+mod3 <- lm(Dprime_change ~ IP2_change + IP1, data = mediation_df)
+
+
+summary(mod1)
+summary(mod2)
+summary(mod3)
+
+set.seed(1)
+med <- mediation::mediate(model.m = mod2, model.y = mod3, sims = 2000, boot = TRUE, boot.ci.type = "bca", treat = "IP1", mediator = "IP2_change")
+summary(med)
+```
+
+## Computational parameter estimates from separate assessment sessions
+Convert assessment data to long format, recode group if desired:
+```{r}
+library(tidyverse)
+
+# Add 'time' column to each dataframe, categorical coding
+active_assessments <- Map(function(df, time) {
+  df$time <- time
+  return(df)
+}, list(training_B, training_M, training_F), c("baseline","midpoint","final"))
+
+# Combine the dataframes vertically
+long_active_assessments <- bind_rows(active_assessments)
+
+# Sort the combined dataframe by 'participant'
+long_active_assessments <- long_active_assessments %>% arrange(Participant)
+
+# Add 'group' column with value 'training' for all rows
+long_active_assessments$group <- 'training'
+
+# Control assessments:
+# Add 'time' column to each dataframe
+control_assessments <- Map(function(df, time) {
+  df$time <- time
+  return(df)
+}, list(control_B, control_M, control_F), c("baseline","midpoint","final"))
+
+# Combine the dataframes vertically
+long_control_assessments <- bind_rows(control_assessments)
+
+# Sort the combined dataframe by 'participant'
+long_control_assessments <- long_control_assessments %>% arrange(Participant)
+
+# Add 'group' column with value 'training' for all rows
+long_control_assessments$group <- 'control'
+
+# Combine the two dataframes vertically
+long_df <- bind_rows(long_active_assessments, long_control_assessments)
+
+
+# Add Sex and Age data
+merged_df <- merge(long_df, df[, c("Participant", "Age", "Sex")], by = "Participant", all.x = TRUE)
+long_df <- merged_df
+rm(merged_df)
+
+shapiro.test(long_df$IP1)
+shapiro.test(long_df$IP2)
+shapiro.test(long_df$pS)
+
+hist(long_df$IP1, main = "Histogram of IP1", xlab = "IP1 Values", ylab = "Frequency")
+hist(long_df$IP2, main = "Histogram of IP2", xlab = "IP2 Values", ylab = "Frequency")
+hist(long_df$pS, main = "Histogram of pS", xlab = "pS Values", ylab = "Frequency")
+
+
+# Recode group here: control = -1, training = 1
+long_df$group <- ifelse(long_df$group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+long_df$Sex <- ifelse(long_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+long_df[, "Age"] <- scale(long_df[, "Age"], center = TRUE, scale = FALSE)
+
+long_df
+
+```
+
+
+```{r Change in IP1}
+
+library(lmerTest)
+
+model <- lmer(formula = IP1 ~ group * time + Sex + Age + (1 | Participant), 
+               data    = long_df)
+summary(model)
+
+# vif(model)
+
+library(jtools)
+summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+# tab_model(model)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  time|group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+
+```
+
+
+```{r Change in IP2}
+
+library(lmerTest)
+
+model <- lmer(formula = IP2 ~ group * time + Sex + Age + (1 | Participant), 
+               data    = long_df)
+summary(model)
+
+# vif(model)
+
+library(jtools)
+summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+# tab_model(model)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  time|group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+
+```
+
+
+```{r Change in pS}
+
+library(lmerTest)
+
+model <- lmer(formula = pS ~ group * time + Sex + Age + (1 | Participant), 
+               data    = long_df)
+summary(model)
+
+# vif(model)
+
+library(jtools)
+summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+# tab_model(model)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  time|group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+
+```
+
+#Anxiety
+## Baseline anxiety and change in anxiety
+
+```{r Baseline anxiety normal distribution tests}
+
+shapiro.test(df$Trait_BL)
+shapiro.test(df$State_BL)
+
+```
+
+```{r Change in trait anxiety}
+# Select subset of columns
+temp_df <- df[,c('Condition', 'Participant', 'Age', 'Sex', "State_BL", "State_FL")]
+
+# Convert to long form
+long_df <- pivot_longer(temp_df, cols = starts_with("State"), names_to = "Time", values_to = "State")
+
+# Rename timepoints 
+long_df <- long_df %>%
+  mutate(Time = case_when(
+    Time == "State_BL" ~ "baseline",
+    Time == "State_ML" ~ "midpoint",
+    Time == "State_FL" ~ "final",
+    TRUE ~ Time  # Keep other values unchanged
+  ))
+
+# Rename 'Condition' column to 'Group'
+names(long_df)[names(long_df) == "Condition"] <- "Group"
+
+# Recode group here: control = -1, training = 1
+long_df$Group <- ifelse(long_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+long_df$Sex <- ifelse(long_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+long_df[, "Age"] <- scale(long_df[, "Age"], center = TRUE, scale = FALSE)
+
+long_df
+
+
+library(lmerTest)
+
+model <- lmer(formula = State ~ Group * Time + Age + Sex +  (1 | Participant), 
+               data    = long_df)
+
+summary(model)
+
+# vif(model)
+
+library(jtools)
+summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+# tab_model(model)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  Time|Group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+
+```
+
+
+
+
+```{r Change in trait anxiety}
+# Select subset of columns
+temp_df <- df[,c('Condition', 'Participant', 'Age', 'Sex', "Trait_BL", "Trait_FL")]
+
+# Convert to long form
+long_df <- pivot_longer(temp_df, cols = starts_with("Trait"), names_to = "Time", values_to = "Trait")
+
+# Rename timepoints 
+long_df <- long_df %>%
+  mutate(Time = case_when(
+    Time == "Trait_BL" ~ "baseline",
+    Time == "Trait_ML" ~ "midpoint",
+    Time == "Trait_FL" ~ "final",
+    TRUE ~ Time  # Keep other values unchanged
+  ))
+
+# Rename 'Condition' column to 'Group'
+names(long_df)[names(long_df) == "Condition"] <- "Group"
+
+# Recode group here: control = -1, training = 1
+long_df$Group <- ifelse(long_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+long_df$Sex <- ifelse(long_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+long_df[, "Age"] <- scale(long_df[, "Age"], center = TRUE, scale = FALSE)
+
+long_df
+
+
+library(lmerTest)
+
+model <- lmer(formula = Trait ~ Group * Time + Age + Sex + (1 | Participant), 
+               data    = long_df)
+
+summary(model)
+
+# vif(model)
+
+library(jtools)
+summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+# tab_model(model)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  Time|Group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+
+```
+
+
+## Relationships between change in anxiety and computational parameters 
+
+### Training group only
+```{r Prepare data for LMEs}
+anx_cols <- c("TraitAnxietyChange_FmB", "StateAnxietyChange_FmB")
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE) %>% 
+  filter(Group == "training")
+
+# Save transformation for IP2_change for plotting later
+transformation_IP2_change <- optLogTransform(data.matrix(temp_df[, 'IP2_change']), type = "log", scaled = FALSE, skew_thresh = .5)
+
+# Transform any non-normal variables
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,"IP2_change", anx_cols))
+
+# Recode group : control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+temp_df
+```
+
+
+```{r LME to explain change in state anxiety}
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + IP2_change + pS +  State_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+
+# Excluding IP2 as a predictor reduces collinearity
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2_change + pS +  State_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+
+library(jtools)
+library(sjPlot)
+
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Partial residuals plots -----------------------")
+
+# Effects package: predictor effect plots with partial residuals
+library(effects)
+est<-Effect("pS", model,  residuals=TRUE, KR = TRUE)
+plot(est,
+     axes = list(x = list(pS = list(lab="pS")),
+                 y = list(lab="Change in state anxiety", lim = c(-33, 33)),
+                 grid = TRUE),
+     lines = list(col = c("black", "darkgrey")),
+     partial.residuals = list(smooth=TRUE, lty="dashed", pch = 1, cex = .7))
+
+# Check that partial residuals take on different values to the raw data
+# plot(temp_df$pS, temp_df$StateAnxietyChange_FmB)
+
+```
+
+```{r Ridge regression state anxiety}
+library(ridge)
+set.seed(1)
+
+model <- linearRidge(temp_df$StateAnxietyChange_FmB ~ IP1 + IP2 + IP2_change + pS + State_BL + Age + Sex, data = temp_df)
+
+# Excluding IP2 as a predictor reduces collinearity
+model <- linearRidge(temp_df$StateAnxietyChange_FmB ~ IP1 + IP2_change + pS + State_BL + Age + Sex, data = temp_df)
+
+summary(model)
+
+```
+
+```{r LME to explain change in trait anxiety}
+
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + IP2_change + pS + Trait_BL + Age + Sex +  (1 | Sex), 
+               data    = temp_df)
+
+# Excluding IP2 as a predictor reduces collinearity
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 +  IP2_change + pS + Trait_BL + Age + Sex +  (1 | Sex), 
+               data    = temp_df)
+
+library(jtools)
+# summ(model, digits = 3, t.df = "k-r")
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+
+print("----------------------- Partial residuals plots -----------------------")
+
+# Effects package: predictor effect plots with partial residuals
+library(effects)
+est<-Effect("IP1", model,  residuals=TRUE, KR = TRUE)
+plot(est,
+     axes = list(x = list(IP1 = list(lab="IP1")),
+                 y = list(lab="Change in trait anxiety", lim = c(-33, 33)),
+                 grid = TRUE),
+     lines = list(col = c("black", "darkgrey")),
+     partial.residuals = list(smooth=TRUE, lty="dashed", pch = 1, cex = .7))
+
+
+est<-predictorEffect("IP2_change", model,  residuals=TRUE, KR = TRUE)
+
+plot(est,
+     axes = list(
+       x = list(
+         IP2_change = list(# transform=
+                             # list(trans=function(x) exp(x) - 0.34987),
+                             # list(trans=log, inverse = exp),
+                            #list(trans=function(x) exp(x) - 0.34987, inverse=function(x) exp(x) - 0.34987),
+                           # type="response",
+                           # ticks = list(at = c(-1, -0.5, 0, 0.5, 1)),
+                           lab=expression(Delta ~ "IP2 (log-transformed)"),
+                           lim=c(-2, 0)
+                           )),
+       y = list(
+         lab="Change in trait anxiety", 
+         lim = c(-33, 33)),
+       grid = TRUE),
+     lines = list(col = c("black", "darkgrey")),
+     partial.residuals = list(smooth=TRUE, lty="dashed", pch = 1, cex = .7))
+
+segments(x0 = 0, y0 = -16, x1 = 0, y1 = 15, col = "darkblue", lty = 2, lwd = 1.5)
+
+# Transformed value of IP2_change = 0
+transformation_IP2_change$func
+log(0 + 0.34987)
+
+```
+
+
+
+```{r Ridge regression trait anxiety}
+library(ridge)
+set.seed(1)
+
+model <- linearRidge(temp_df$TraitAnxietyChange_FmB ~ IP1 + IP2 + IP2_change + pS + Trait_BL + Age + Sex, data = temp_df)
+
+# Excluding IP2 as a predictor reduces collinearity
+model <- linearRidge(temp_df$TraitAnxietyChange_FmB ~ IP1 + IP2_change + pS + Trait_BL + Age + Sex, data = temp_df)
+
+summary(model)
+```
+
+
+### Both groups pooled
+
+```{r Prepare data for LMEs}
+anx_cols <- c("TraitAnxietyChange_FmB", "StateAnxietyChange_FmB")
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE)
+
+# Transform any non-normal computational parameters
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,"IP2_change", anx_cols))
+
+# Recode group : control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+temp_df
+```
+
+```{r LME to explain change in state anxiety}
+
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + IP2_change + pS + State_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+
+library(jtools)
+# summ(model)
+
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+```{r LME to predict change in trait anxiety}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + IP2_change + pS + Trait_BL + Age + Sex +  (1 | Sex), 
+               data    = temp_df)
+
+
+library(jtools)
+# summ(model)
+
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+
+### Control group only
+```{r Prepare data for LMEs}
+anx_cols <- c("TraitAnxietyChange_FmB", "StateAnxietyChange_FmB")
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE) %>% 
+  filter(Group == "control")
+
+# Transform any non-normal computational parameters
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,"IP2_change", anx_cols))
+
+# Recode group : control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+temp_df
+```
+
+
+```{r Multiple regression to predict change in state anxiety}
+model <- lm(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + IP2_change + pS + State_BL + Age + Sex, 
+               data    = temp_df)
+
+# Exclude IP2 to improve VIFs; no change in results
+# model <- lm(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2_change + pS + # State_BL + Age + Sex, 
+#                data    = temp_df)
+
+library(jtools)
+# summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+```{r Ridge regression state anxiety}
+library(ridge)
+set.seed(1)
+
+model <- linearRidge(temp_df$StateAnxietyChange_FmB ~ IP1 + IP2 + IP2_change + pS + State_BL + Age + Sex, data = temp_df)
+
+# Excluding IP2 as a predictor reduces collinearity
+model <- linearRidge(temp_df$StateAnxietyChange_FmB ~ IP1 + IP2_change + pS + State_BL + Age + Sex, data = temp_df)
+
+summary(model)
+
+```
+
+```{r Multiple regression to predict change in trait anxiety}
+model <- lm(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + IP2_change + pS + Trait_BL + Age + Sex, 
+               data    = temp_df)
+
+# Exclude IP2 to improve VIFs; no change in results
+#model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2_change + pS + #Trait_BL + Age + Sex + (1 | Sex), 
+#               data    = temp_df)
+
+
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+```{r Ridge regression trait anxiety}
+library(ridge)
+set.seed(1)
+
+model <- linearRidge(temp_df$TraitAnxietyChange_FmB ~ IP1 + IP2 + IP2_change + pS + Trait_BL + Age + Sex, data = temp_df)
+
+# Excluding IP2 as a predictor reduces collinearity
+model <- linearRidge(temp_df$TraitAnxietyChange_FmB ~ IP1 + IP2_change + pS + Trait_BL + Age + Sex, data = temp_df)
+
+summary(model)
+```
+
+## (Supplementary 7) Relationships between change in anxiety and conventional interoceptive task measures 
+
+### Training group only
+```{r Prepare data for LMEs}
+anx_cols <- c("TraitAnxietyChange_FmB", "StateAnxietyChange_FmB")
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE) %>% 
+  filter(Group == "training")
+
+# Calculate change in conventional task measures from baseline to final timepoints
+temp_df$Dprime_change <- temp_df$Dprime_F - temp_df$Dprime_BL
+temp_df$Cvalue_change <- temp_df$Cvalue_F - temp_df$Cvalue_BL
+temp_df$HBT_change <- temp_df$HBT_FL - temp_df$HBT_BL
+
+shapiro.test(temp_df$Dprime_change)
+shapiro.test(temp_df$Cvalue_change)
+shapiro.test(temp_df$HBT_change)
+
+# Transform any non-normal variables
+temp_df <- applyOptLogTransform(temp_df, c("Cvalue_change"))
+
+# Recode group : control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+
+temp_df
+
+```
+```{r Multiple regression to predict change in state anxiety}
+model <- lm(formula = StateAnxietyChange_FmB ~ 1 + Dprime_change + Cvalue_change + HBT_change + State_BL + Age + Sex, 
+               data    = temp_df)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+```{r LME to predict change in trait anxiety}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + Dprime_change + Cvalue_change + HBT_change + Trait_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+### Control group only
+```{r Prepare data for LMEs}
+anx_cols <- c("TraitAnxietyChange_FmB", "StateAnxietyChange_FmB")
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE) %>% 
+  filter(Group == "control")
+
+# Calculate change in conventional task measures from baseline to final timepoints
+temp_df$Dprime_change <- temp_df$Dprime_F - temp_df$Dprime_BL
+temp_df$Cvalue_change <- temp_df$Cvalue_F - temp_df$Cvalue_BL
+temp_df$HBT_change <- temp_df$HBT_FL - temp_df$HBT_BL
+
+shapiro.test(temp_df$Dprime_change)
+shapiro.test(temp_df$Cvalue_change)
+shapiro.test(temp_df$HBT_change)
+
+# Transform any non-normal variables
+temp_df <- applyOptLogTransform(temp_df, c("Cvalue_change"))
+
+# Recode group : control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+
+temp_df
+
+```
+```{r Multiple regression to predict change in state anxiety}
+model <- lm(formula = StateAnxietyChange_FmB ~ 1 + Dprime_change + Cvalue_change + HBT_change + State_BL + Age + Sex, 
+               data    = temp_df)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+```{r LME to predict change in trait anxiety}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + Dprime_change + Cvalue_change + HBT_change + Trait_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+### Both groups pooled
+```{r Prepare data for LMEs}
+anx_cols <- c("TraitAnxietyChange_FmB", "StateAnxietyChange_FmB")
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE)
+
+# Calculate change in conventional task measures from baseline to final timepoints
+temp_df$Dprime_change <- temp_df$Dprime_F - temp_df$Dprime_BL
+temp_df$Cvalue_change <- temp_df$Cvalue_F - temp_df$Cvalue_BL
+temp_df$HBT_change <- temp_df$HBT_FL - temp_df$HBT_BL
+
+shapiro.test(temp_df$Dprime_change)
+shapiro.test(temp_df$Cvalue_change)
+shapiro.test(temp_df$HBT_change)
+
+# Transform any non-normal variables
+temp_df <- applyOptLogTransform(temp_df, c("Cvalue_change"))
+
+# Recode group : control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+
+temp_df
+
+```
+```{r Multiple regression to predict change in state anxiety}
+model <- lm(formula = StateAnxietyChange_FmB ~ 1 + Dprime_change + Cvalue_change + HBT_change + State_BL + Age + Sex, 
+               data    = temp_df)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+```{r LME to predict change in trait anxiety}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + Dprime_change + Cvalue_change + HBT_change + Trait_BL + Age + Sex + (1 | Group), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+# Self-reported interoception
+
+## Change in MAIA total score
+```{r Prepare data for LMEs}
+MAIA_change_cols = c("Change_MAIA_Noticing_FLmBL", "Change_MAIA_NotDistracting_FLmBL","Change_MAIA_NotWorrying_FLmBL", "Change_MAIA_AttentionReg_FLmBL", "Change_MAIA_EmoAware_FLmBL", "Change_MAIA_SelfReg_FLmBL", "Change_MAIA_BodyList_FLmBL", "Change_MAIA_Trusting_FLmBL")
+
+MAIA_BL_cols <- c('NoticingBL', 'not_distractingBL', 'not_worryingBL', 'attention_regulationBL','emotional_awarenessBL', 'self_regulationBL', 'body_listeningBL', 'trustingBL')
+MAIA_FL_cols <- c('NoticingFL','not_distractingFL','not_worryingFL','attention_regulationFL','emotional_awarenessFL','self_regulationFL','body_listeningFL','trustingFL')
+
+
+# Select subset of columns
+temp_df <- df[,c('Condition', 'Participant', 'Age', 'Sex', MAIA_change_cols, MAIA_BL_cols, MAIA_FL_cols)]
+
+temp_df
+
+# Rename 'Condition' column to 'Group'
+names(temp_df)[names(temp_df) == "Condition"] <- "Group"
+
+# Recode group here: control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+
+# Calculate total MAIA baseline score
+temp_df$MAIA_totalBL <- rowSums(temp_df[, MAIA_BL_cols], na.rm = TRUE)
+
+# Calculate total MAIA final score
+temp_df$MAIA_totalFL <- rowSums(temp_df[, MAIA_FL_cols], na.rm = TRUE)
+
+temp_df
+
+```
+
+```{r LME}
+
+col_name <- "MAIA_total"
+# Convert to long form
+long_df <- temp_df[,c('Group', 'Participant', 'Age', 'Sex', 'MAIA_totalBL', 'MAIA_totalFL')]
+long_df <- pivot_longer(long_df, cols = starts_with(col_name), names_to = "Time", values_to = col_name)
+
+long_df <- long_df %>%
+  mutate(Time = ifelse(grepl("BL$", Time), "baseline", 
+                                ifelse(grepl("FL$", Time), "final", Time)))
+
+
+# long_df
+
+library(lmerTest)
+
+model <- lmer(paste(col_name, "~ Group + Time + Age + Sex + Group:Time + (1 | Participant)"), data = long_df)
+
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  Time|Group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+```
+
+
+## Change in MAIA subscales
+```{r Prepare data for LMEs}
+MAIA_change_cols = c("Change_MAIA_Noticing_FLmBL", "Change_MAIA_NotDistracting_FLmBL","Change_MAIA_NotWorrying_FLmBL", "Change_MAIA_AttentionReg_FLmBL", "Change_MAIA_EmoAware_FLmBL", "Change_MAIA_SelfReg_FLmBL", "Change_MAIA_BodyList_FLmBL", "Change_MAIA_Trusting_FLmBL")
+
+MAIA_BL_cols <- c('NoticingBL', 'not_distractingBL', 'not_worryingBL', 'attention_regulationBL','emotional_awarenessBL', 'self_regulationBL', 'body_listeningBL', 'trustingBL')
+MAIA_FL_cols <- c('NoticingFL','not_distractingFL','not_worryingFL','attention_regulationFL','emotional_awarenessFL','self_regulationFL','body_listeningFL','trustingFL')
+
+# Select subset of columns
+temp_df <- df[,c('Condition', 'Participant', 'Age', 'Sex', MAIA_change_cols, MAIA_BL_cols, MAIA_FL_cols)]
+
+temp_df
+# Convert to long form
+# long_df <- pivot_longer(temp_df, cols = starts_with("Trait"), names_to = "Time", values_to = "Trait")
+
+# Rename 'Condition' column to 'Group'
+names(temp_df)[names(temp_df) == "Condition"] <- "Group"
+
+# Recode group here: control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+
+
+temp_df
+
+```
+
+This block runs an LME for one subscale; change the variable 'col' to change the subscale to analyse.
+```{r LMEs}
+col <- 1 # Change from 1 through 8 to run LME
+col_name <- str_sub(MAIA_BL_cols[col],1,-3)
+# Convert to long form
+long_df <- temp_df[,c('Group', 'Participant', 'Age', 'Sex', MAIA_BL_cols[col], MAIA_FL_cols[col])]
+long_df <- pivot_longer(long_df, cols = starts_with(col_name), names_to = "Time", values_to = col_name)
+
+long_df <- long_df %>%
+  mutate(Time = ifelse(grepl("BL$", Time), "baseline", 
+                                ifelse(grepl("FL$", Time), "final", Time)))
+
+
+long_df
+
+library(lmerTest)
+
+model <- lmer(paste(col_name, "~ Group + Time + Age + Sex + Group:Time + (1 | Participant)"), data = long_df)
+
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+
+print("----------------------- EMMEANS -----------------------")
+
+library(emmeans)
+emm1 = emmeans(model, specs = pairwise ~  Time|Group, lmer.df = "kenward-roger", calc = c(n = ".wgt."), weights = "prop")
+summary(emm1, adjust="None")
+#emm1$emmeans
+#emm1$contrasts
+
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+print("----------------------- Effect size -----------------------")
+eff_size(emm1, sigma = sigma(model), edf = df.residual(model))
+```
+
+
+## Relationships with computational parameter estimates 
+
+```{r Exploratory correlations (in training group only)}
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE) %>%
+  filter(Group == "training")
+
+# Calculate total MAIA baseline score
+temp_df$MAIA_totalBL <- rowSums(temp_df[, MAIA_BL_cols], na.rm = TRUE)
+
+# Calculate total MAIA final score
+temp_df$MAIA_totalFL <- rowSums(temp_df[, MAIA_FL_cols], na.rm = TRUE)
+
+# Calculate change in MAIA total score
+temp_df$MAIA_total_change <- temp_df$MAIA_totalBL - temp_df$MAIA_totalFL
+  
+# Transform any non-normal variables
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,MAIA_change_cols, MAIA_BL_cols, "MAIA_total_change", "MAIA_totalBL"))
+
+cor_matrix <- cor(temp_df[, MAIA_change_cols], temp_df[, param_cols], use = "complete.obs")
+cor_matrix
+
+cor_matrix <- cor(temp_df[, MAIA_BL_cols], temp_df[, param_cols], use = "complete.obs")
+cor_matrix
+
+
+# Total MAIA score change and parameters
+cor.test(temp_df$MAIA_total_change, temp_df$IP1, method = "pearson")
+cor.test(temp_df$MAIA_total_change, temp_df$IP2, method = "pearson")
+cor.test(temp_df$MAIA_total_change, temp_df$pS, method = "pearson") # Significant, do post-hocs
+
+# Post-hocs
+# cor.test(temp_df$Change_MAIA_Trusting_FLmBL, temp_df$IP1, method = "pearson")
+cor.test(temp_df$Change_MAIA_Noticing_FLmBL, temp_df$pS, method = "pearson")
+cor.test(temp_df$Change_MAIA_Trusting_FLmBL, temp_df$pS, method = "pearson")
+
+
+# Baseline MAIA total score and parameters - none are significant
+cor.test(temp_df$MAIA_totalBL, temp_df$IP1, method = "pearson")
+cor.test(temp_df$MAIA_totalBL, temp_df$IP2, method = "pearson")
+cor.test(temp_df$MAIA_totalBL, temp_df$pS, method = "pearson")
+
+# Baseline post-hocs
+# cor.test(temp_df$NoticingBL, temp_df$IP2, method = "pearson")
+
+```
+
+```{r Exploratory correlations (in both groups pooled)}
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE)
+
+# Calculate total MAIA baseline score
+temp_df$MAIA_totalBL <- rowSums(temp_df[, MAIA_BL_cols], na.rm = TRUE)
+
+# Calculate total MAIA final score
+temp_df$MAIA_totalFL <- rowSums(temp_df[, MAIA_FL_cols], na.rm = TRUE)
+
+# Calculate change in MAIA total score
+temp_df$MAIA_total_change <- temp_df$MAIA_totalBL - temp_df$MAIA_totalFL
+
+# Transform any non-normal variables
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,MAIA_change_cols, MAIA_BL_cols, "MAIA_total_change", "MAIA_totalBL"))
+
+cor_matrix <- cor(temp_df[, MAIA_change_cols], temp_df[, param_cols], use = "complete.obs")
+cor_matrix
+
+cor_matrix <- cor(temp_df[, MAIA_BL_cols], temp_df[, param_cols], use = "complete.obs")
+cor_matrix
+
+
+# Total MAIA score change and parameters - none are significant
+cor.test(temp_df$MAIA_total_change, temp_df$IP1, method = "pearson")
+cor.test(temp_df$MAIA_total_change, temp_df$IP2, method = "pearson")
+cor.test(temp_df$MAIA_total_change, temp_df$pS, method = "pearson")
+
+# Post-hoc
+cor.test(temp_df$not_distractingBL, temp_df$IP2, method = "pearson")
+
+# Baseline MAIA total score and parameters - none are significant
+cor.test(temp_df$MAIA_totalBL, temp_df$IP1, method = "pearson")
+cor.test(temp_df$MAIA_totalBL, temp_df$IP2, method = "pearson")
+cor.test(temp_df$MAIA_totalBL, temp_df$pS, method = "pearson")
+
+# Baseline post-hocs
+# cor.test(temp_df$NoticingBL, temp_df$IP2, method = "pearson")
+
+```
+
+## Relationships with anxiety reduction
+
+```{r Exploratory correlations (in training group only)}
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE) %>%
+  filter(Group == "training")
+
+# Calculate total MAIA baseline score
+temp_df$MAIA_totalBL <- rowSums(temp_df[, MAIA_BL_cols], na.rm = TRUE)
+
+# Calculate total MAIA final score
+temp_df$MAIA_totalFL <- rowSums(temp_df[, MAIA_FL_cols], na.rm = TRUE)
+
+# Calculate change in MAIA total score
+temp_df$MAIA_total_change <- temp_df$MAIA_totalBL - temp_df$MAIA_totalFL
+  
+# Transform any non-normal variables
+temp_df <- applyOptLogTransform(temp_df, c(anx_cols,MAIA_change_cols, MAIA_BL_cols, "MAIA_total_change"))
+
+cor_matrix <- cor(temp_df[, MAIA_change_cols], temp_df[, anx_cols], use = "complete.obs")
+cor_matrix
+
+cor_matrix <- cor(temp_df[, MAIA_BL_cols], temp_df[, anx_cols], use = "complete.obs")
+cor_matrix
+
+# Total score
+cor.test(temp_df$MAIA_total_change, temp_df$StateAnxietyChange_FmB, method = "pearson")
+cor.test(temp_df$MAIA_total_change, temp_df$TraitAnxietyChange_FmB, method = "pearson") # Significant, do post-hocs
+
+#Post-hocs
+# cor.test(temp_df$Change_MAIA_NotWorrying_FLmBL, temp_df$StateAnxietyChange_FmB, method = "pearson")
+cor.test(temp_df$Change_MAIA_AttentionReg_FLmBL, temp_df$TraitAnxietyChange_FmB, method = "pearson")
+
+
+```
+```{r Exploratory correlations (in both groups pooled)}
+temp_df <- merge(combined_df, df, by = "Participant", all.x = TRUE)
+
+# Calculate total MAIA baseline score
+temp_df$MAIA_totalBL <- rowSums(temp_df[, MAIA_BL_cols], na.rm = TRUE)
+
+# Calculate total MAIA final score
+temp_df$MAIA_totalFL <- rowSums(temp_df[, MAIA_FL_cols], na.rm = TRUE)
+
+# Calculate change in MAIA total score
+temp_df$MAIA_total_change <- temp_df$MAIA_totalBL - temp_df$MAIA_totalFL
+  
+# Transform any non-normal variables
+temp_df <- applyOptLogTransform(temp_df, c(anx_cols,MAIA_change_cols, MAIA_BL_cols, "MAIA_total_change"))
+
+cor_matrix <- cor(temp_df[, MAIA_change_cols], temp_df[, anx_cols], use = "complete.obs")
+cor_matrix
+
+cor_matrix <- cor(temp_df[, MAIA_BL_cols], temp_df[, anx_cols], use = "complete.obs")
+cor_matrix
+
+# Total score
+cor.test(temp_df$MAIA_total_change, temp_df$StateAnxietyChange_FmB, method = "pearson")
+cor.test(temp_df$MAIA_total_change, temp_df$TraitAnxietyChange_FmB, method = "pearson") # Significant, do post-hocs
+
+#Post-hocs - none are significant for trait anxiety
+cor.test(temp_df[, c(MAIA_change_cols[8])], temp_df$TraitAnxietyChange_FmB, method = "pearson")
+
+```
+
+
+
+# Relationships between anxiety change and computational parameter estimates derived from assessment sessions (no significant effects)
+
+## Predict anxiety change using baseline computational parameters
+### Training group only
+
+```{r Prepare data for LMEs}
+
+temp_df <- training_B
+temp_df <- merge(temp_df, df, by = "Participant", all.x = TRUE)
+temp_df$Group <- ifelse(grepl("C", temp_df$Participant), "control", "training")
+
+# Transform any non-normal variables from right dataframe
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,anx_cols,baseline_cols))
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+
+# Recode group here: control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+
+
+temp_df
+```
+
+
+```{r Trait anxiety change}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + Trait_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+```
+
+
+```{r State anxiety change}
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + State_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+
+### Control group only
+```{r Prepare data for LMEs}
+
+temp_df <- control_B
+temp_df <- merge(temp_df, df, by = "Participant", all.x = TRUE)
+temp_df$Group <- ifelse(grepl("C", temp_df$Participant), "control", "training")
+
+# Transform any non-normal variables from right dataframe
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,anx_cols,baseline_cols))
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+
+# Recode group here: control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+
+
+temp_df
+```
+
+
+```{r Trait anxiety change}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + Trait_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+```
+
+
+```{r State anxiety change}
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + State_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+### Both groups pooled
+
+```{r Prepare data for LMEs}
+
+temp_df <- rbind(training_B, control_B)
+temp_df <- merge(temp_df, df, by = "Participant", all.x = TRUE)
+temp_df$Group <- ifelse(grepl("C", temp_df$Participant), "control", "training")
+
+# Transform any non-normal variables from right dataframe
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,anx_cols,baseline_cols))
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+
+# Recode group here: control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+
+
+temp_df
+```
+
+```{r Trait anxiety change}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + Trait_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+```
+
+
+```{r State anxiety change}
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + State_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+## Predict anxiety change using change in assessment-derived parameter estimates
+
+### In training group only
+```{r Prepare data for LMEs}
+temp_df_training <- merge(training_B, training_F, by = "Participant", all.x = TRUE)
+temp_df_training$IP1 <- temp_df_training$IP1.y - temp_df_training$IP1.x
+temp_df_training$IP2 <- temp_df_training$IP2.y - temp_df_training$IP2.x
+temp_df_training$pS  <- temp_df_training$pS.y - temp_df_training$pS.x
+
+temp_df <- temp_df_training
+
+temp_df <- merge(temp_df, df[,c("Participant","Age","Sex", "Condition", anx_cols,baseline_cols)], by = "Participant", all.x = TRUE)
+
+# Rename 'Condition' column to 'Group'
+names(temp_df)[names(temp_df) == "Condition"] <- "Group"
+temp_df$Group <- ifelse(grepl("C", temp_df$Participant), "control", "training")
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Recode group here: control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+# Transform any non-normal variables from right dataframe
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,right_cols))
+
+temp_df
+```
+
+```{r Trait anxiety change}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + Trait_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+```
+
+
+```{r State anxiety change}
+model <- lm(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + State_BL + Age + Sex, 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+### In control group only
+```{r Prepare data for LMEs}
+
+temp_df_control <- merge(control_B, control_F, by = "Participant", all.x = TRUE)
+temp_df_control$IP1 <- temp_df_control$IP1.y - temp_df_control$IP1.x
+temp_df_control$IP2 <- temp_df_control$IP2.y - temp_df_control$IP2.x
+temp_df_control$pS  <- temp_df_control$pS.y - temp_df_control$pS.x
+
+temp_df <- temp_df_control
+
+temp_df <- merge(temp_df, df[,c("Participant","Age","Sex", "Condition", anx_cols,baseline_cols)], by = "Participant", all.x = TRUE)
+
+# Rename 'Condition' column to 'Group'
+names(temp_df)[names(temp_df) == "Condition"] <- "Group"
+temp_df$Group <- ifelse(grepl("C", temp_df$Participant), "control", "training")
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Recode group here: control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+# Transform any non-normal variables from right dataframe
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,right_cols))
+
+temp_df
+```
+
+```{r Trait anxiety change}
+model <- lm(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + Trait_BL + Age + Sex, 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+```
+
+
+```{r State anxiety change}
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + State_BL + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+### In both groups pooled
+```{r Prepare data for LMEs}
+temp_df_training <- merge(training_B, training_F, by = "Participant", all.x = TRUE)
+temp_df_training$IP1 <- temp_df_training$IP1.y - temp_df_training$IP1.x
+temp_df_training$IP2 <- temp_df_training$IP2.y - temp_df_training$IP2.x
+temp_df_training$pS  <- temp_df_training$pS.y - temp_df_training$pS.x
+
+temp_df_control <- merge(control_B, control_F, by = "Participant", all.x = TRUE)
+temp_df_control$IP1 <- temp_df_control$IP1.y - temp_df_control$IP1.x
+temp_df_control$IP2 <- temp_df_control$IP2.y - temp_df_control$IP2.x
+temp_df_control$pS  <- temp_df_control$pS.y - temp_df_control$pS.x
+
+temp_df <- bind_rows(temp_df_training[,c('Participant','IP1','IP2', 'pS')], temp_df_control[,c('Participant','IP1','IP2', 'pS')])
+
+temp_df <- merge(temp_df, df[,c("Participant","Age","Sex", "Condition", anx_cols,baseline_cols)], by = "Participant", all.x = TRUE)
+
+# Rename 'Condition' column to 'Group'
+names(temp_df)[names(temp_df) == "Condition"] <- "Group"
+temp_df$Group <- ifelse(grepl("C", temp_df$Participant), "control", "training")
+
+# Recode sex into sum coding: male = -1, female = 1
+temp_df$Sex <- ifelse(temp_df$Sex == "Male", -1, 1)
+
+# Recode group here: control = -1, training = 1
+temp_df$Group <- ifelse(temp_df$Group == "control", -1, 1)
+
+# Mean centre age
+temp_df[, "Age"] <- scale(temp_df[, "Age"], center = TRUE, scale = FALSE)
+
+# Transform any non-normal variables from right dataframe
+temp_df <- applyOptLogTransform(temp_df, c(param_cols,right_cols))
+
+
+temp_df
+```
+
+```{r Trait anxiety change}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + Trait_BL + Age + Sex + (1 | Group), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+
+```
+
+
+```{r State anxiety change}
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + IP1 + IP2 + pS + State_BL + Age + Sex + (1 | Group), 
+               data    = temp_df)
+# summary(model)
+
+library(jtools)
+summ(model)
+library(sjPlot)
+tab_model(model)
+
+print("----------------------- EMTRENDS -----------------------")
+
+# library(emmeans)
+# emt <- emtrends(model,specs=pairwise~Sex,var="IP2")
+# summary(emt,infer=TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk Test:\n")
+cat("Statistic: ", shapiro_test$statistic, "\n")
+cat("p-value: ", shapiro_test$p.value, "\n")
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
