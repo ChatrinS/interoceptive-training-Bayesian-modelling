@@ -1,0 +1,668 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(lavaan)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+```
+
+
+# Import training group training data, and control group assessment trial-by-trial data for heartbeat discrimination task
+
+```{r}
+df <- read.csv("data/data.csv")
+data_path <- "./data/processed/"
+csv_files <- list.files(path = data_path, pattern = "\\.csv$", full.names = TRUE)
+data_list <- csv_files %>%
+  set_names(~ tools::file_path_sans_ext(basename(.x))) %>%
+  map(read_csv)
+row_counts <- map_int(data_list, nrow)
+print(row_counts)
+
+```
+
+
+
+```{r}
+
+library(tidyverse)
+
+training_df <- imap_dfr(data_list, ~ mutate(.x)) # , participant = .y
+
+# Recode 'session' column: bl -> 1, MA -> 2, exit -> 3
+training_df <- training_df %>%
+  mutate(
+    session = case_when(
+      session == "bl"   ~ 1L,
+      session == "MA"   ~ 2L,
+      session == "exit" ~ 3L,
+      TRUE              ~ NA_integer_
+    )
+  )
+
+# Remove 'sub' and 'C' from the participant column, convert to integer, then sort
+training_df <- training_df %>%
+  mutate(
+    Participant = str_remove(Participant, "sub"),
+    Participant = str_remove(Participant, "C"),
+    Participant = as.integer(Participant)
+  ) %>%
+  arrange(Participant)
+
+head(training_df)
+
+
+```
+
+
+```{r}
+data_path <- "./data/assessment/control/"
+csv_files <- list.files(path = data_path, pattern = "\\.csv$", full.names = TRUE)
+data_list <- csv_files %>%
+  set_names(~ tools::file_path_sans_ext(basename(.x))) %>%
+  map(read_csv)
+row_counts <- map_int(data_list, nrow)
+
+print(row_counts)
+
+```
+
+
+
+```{r}
+
+library(tidyverse)
+
+control_df <- imap_dfr(data_list, ~ mutate(.x)) # , participant = .y
+
+# Recode 'session' column: bl -> 1, MA -> 2, exit -> 3
+control_df <- control_df %>%
+  mutate(
+    session = case_when(
+      session == "bl"   ~ 1L,
+      session == "MA"   ~ 2L,
+      session == "exit" ~ 3L,
+      TRUE              ~ NA_integer_
+    )
+  )
+
+# Remove 'sub' and 'C' from the participant column, convert to integer, then sort
+control_df <- control_df %>%
+  mutate(
+    Participant = str_remove(Participant, "sub"),
+    Participant = str_remove(Participant, "C"),
+    Participant = as.integer(Participant)
+  ) %>%
+  arrange(Participant)
+
+head(control_df)
+
+
+```
+
+```{r}
+data_path <- "./data/assessment/training/"
+csv_files <- list.files(path = data_path, pattern = "\\.csv$", full.names = TRUE)
+data_list <- csv_files %>%
+  set_names(~ tools::file_path_sans_ext(basename(.x))) %>%
+  map(read_csv)
+row_counts <- map_int(data_list, nrow)
+
+print(row_counts)
+
+training_assessment_df <- imap_dfr(data_list, ~ mutate(.x)) # , participant = .y
+
+# Recode 'session' column: bl -> 1, MA -> 2, exit -> 3
+training_assessment_df <- training_assessment_df %>%
+  mutate(
+    session = case_when(
+      session == "bl"   ~ 1L,
+      session == "MA"   ~ 2L,
+      session == "exit" ~ 3L,
+      TRUE              ~ NA_integer_
+    )
+  )
+
+# Remove 'sub' and 'C' from the participant column, convert to integer, then sort
+training_assessment_df <- training_assessment_df %>%
+  mutate(
+    Participant = str_remove(Participant, "sub"),
+    Participant = str_remove(Participant, "C"),
+    Participant = as.integer(Participant)
+  ) %>%
+  arrange(Participant)
+
+head(training_assessment_df)
+
+
+```
+
+
+```{r Calculate summary: overall response bias, overall accuracy}
+library(dplyr)
+
+summary_training_df <- training_df %>%
+  group_by(Participant) %>%
+  summarise(mean_response = mean(response, na.rm = TRUE),
+            mean_accuracy = mean(response==inSync, na.rm = TRUE)) %>%
+  ungroup()
+
+summary_training_assessment_df <- training_assessment_df %>%
+  group_by(Participant) %>%
+  summarise(mean_response = mean(response, na.rm = TRUE),
+            mean_accuracy = mean(response==inSync, na.rm = TRUE)) %>%
+  ungroup()
+
+
+summary_control_df <- control_df %>%
+  group_by(Participant) %>%
+  summarise(mean_response = mean(response, na.rm = TRUE),
+            mean_accuracy = mean(response==inSync, na.rm = TRUE)) %>%
+  ungroup()
+
+print("Training group - trials pooled across training sessions")
+print(mean(summary_training_df$mean_response))
+sum(summary_training_df$mean_response < 0.5) %>% print()
+sum(summary_training_df$mean_accuracy < 0.5) %>% print()
+
+print("Training group - trials pooled across assessment sessions")
+print(mean(summary_training_assessment_df$mean_response))
+sum(summary_training_assessment_df$mean_response < 0.5) %>% print()
+sum(summary_training_assessment_df$mean_accuracy < 0.5) %>% print()
+
+print("Control group - trials pooled across assessment sessions")
+print(mean(summary_control_df$mean_response))
+sum(summary_control_df$mean_response < 0.5) %>% print()
+sum(summary_control_df$mean_accuracy < 0.5) %>% print()
+
+
+
+```
+
+
+```{r}
+ggplot(summary_training_df, aes(x = mean_response)) +
+  geom_density(fill = "steelblue", alpha = 0.6) +
+  labs(title = "Density of Mean Response",
+       x = "Mean Response",
+       y = "Density") +
+  theme_minimal()
+
+```
+
+# Table 3: Calculate chance performance
+
+```{r Calculate d prime, AUC}
+
+control_SDT_df <- control_df %>%
+  group_by(Participant, session) %>%
+  summarise(
+    hits = sum(response == 1 & inSync == 1),
+    misses = sum(response == 0 & inSync == 1),
+    false_alarms = sum(response == 1 & inSync == 0),
+    correct_rejections = sum(response == 0 & inSync == 0),
+
+    n_target = sum(inSync == 1),
+    n_nontarget = sum(inSync == 0),
+
+    hit_rate = if_else(n_target > 0, hits / n_target, NA_real_),
+    miss_rate = if_else(n_target > 0, misses / n_target, NA_real_),
+    false_alarm_rate = if_else(n_nontarget > 0, false_alarms / n_nontarget, NA_real_),
+    correct_rejection_rate = if_else(n_nontarget > 0, correct_rejections / n_nontarget, NA_real_),
+    
+    accuracy = mean(response == inSync, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    hit_rate_adj = (hits + 0.5) / (n_target + 1),
+    false_alarm_rate_adj = (false_alarms + 0.5) / (n_nontarget + 1),
+
+    z_hit = qnorm(hit_rate_adj),
+    z_fa = qnorm(false_alarm_rate_adj),
+
+    d_prime = z_hit - z_fa,
+    C = -0.5 * (z_hit + z_fa),
+
+    AUC = pnorm(d_prime / sqrt(2)),
+
+    A_prime = case_when(
+      hit_rate > false_alarm_rate ~ 0.5 + ((hit_rate - false_alarm_rate) * (1 + hit_rate - false_alarm_rate)) / (4 * hit_rate * (1 - false_alarm_rate)),
+      hit_rate < false_alarm_rate ~ 0.5 - ((false_alarm_rate - hit_rate) * (1 + false_alarm_rate - hit_rate)) / (4 * false_alarm_rate * (1 - hit_rate)),
+      hit_rate == false_alarm_rate ~ 0.5,
+      TRUE ~ NA_real_
+    )  
+  ) %>%  
+  arrange(Participant)
+
+```
+
+```{r}
+library(dplyr)
+
+calculate_SDT_metrics <- function(df) {
+  df %>%
+    group_by(Participant, session) %>%
+    summarise(
+      hits = sum(response == 1 & inSync == 1),
+      misses = sum(response == 0 & inSync == 1),
+      false_alarms = sum(response == 1 & inSync == 0),
+      correct_rejections = sum(response == 0 & inSync == 0),
+
+      n_target = sum(inSync == 1),
+      n_nontarget = sum(inSync == 0),
+
+      hit_rate = if_else(n_target > 0, hits / n_target, NA_real_),
+      miss_rate = if_else(n_target > 0, misses / n_target, NA_real_),
+      false_alarm_rate = if_else(n_nontarget > 0, false_alarms / n_nontarget, NA_real_),
+      correct_rejection_rate = if_else(n_nontarget > 0, correct_rejections / n_nontarget, NA_real_),
+
+      accuracy = mean(response == inSync, na.rm = TRUE)
+    ) %>%
+    ungroup() %>%
+    mutate(
+      hit_rate_adj = (hits + 0.5) / (n_target + 1),
+      false_alarm_rate_adj = (false_alarms + 0.5) / (n_nontarget + 1),
+
+      z_hit = qnorm(hit_rate_adj),
+      z_fa = qnorm(false_alarm_rate_adj),
+
+      d_prime = z_hit - z_fa,
+      C = -0.5 * (z_hit + z_fa),
+
+      AUC = pnorm(d_prime / sqrt(2)),
+
+      A_prime = case_when(
+        hit_rate > false_alarm_rate ~ 0.5 + ((hit_rate - false_alarm_rate) * (1 + hit_rate - false_alarm_rate)) / (4 * hit_rate * (1 - false_alarm_rate)),
+        hit_rate < false_alarm_rate ~ 0.5 - ((false_alarm_rate - hit_rate) * (1 + false_alarm_rate - hit_rate)) / (4 * false_alarm_rate * (1 - hit_rate)),
+        hit_rate == false_alarm_rate ~ 0.5,
+        TRUE ~ NA_real_
+      )
+    ) %>%
+    arrange(Participant)
+}
+
+control_SDT_df <- calculate_SDT_metrics(control_df)
+training_SDT_df <- calculate_SDT_metrics(training_df)
+training_assessment_SDT_df <- calculate_SDT_metrics(training_assessment_df)
+```
+
+
+```{r Session-wise AUC, Aprime, response accuracy, and dprime 'interoceptors'}
+
+control_SDT_df %>%
+  group_by(session) %>%
+  summarise(
+    n_auc_above_0.50 = sum(AUC >= 0.50, na.rm = TRUE),
+    n_auc_between_0.40_0.60 = sum(AUC >= 0.40 & AUC <= 0.60, na.rm = TRUE),
+    n_auc_below_0.50 = sum(AUC < 0.50, na.rm = TRUE),
+    
+    n_Aprime_above_or_equal_0.5 = sum(A_prime >= 0.5, na.rm = TRUE),
+    n_Aprime_below_0.5 = sum(A_prime < 0.5, na.rm = TRUE),
+    n_Aprime_above_0.75 = sum(A_prime >= 0.75, na.rm = TRUE),
+    n_Aprime_near_chance = sum(A_prime > .4 & A_prime < .6, na.rm = TRUE),
+    
+    n_accuracy_above_or_equal_0.5 = sum(accuracy >= 0.5, na.rm = TRUE),
+    n_accuracy_below_0.5 = sum(accuracy < 0.5, na.rm = TRUE),
+
+    n_dprime_above_0.75 = sum(d_prime > 0.75, na.rm = TRUE),
+    n_dprime_near_chance = sum(d_prime > -.25 & d_prime < +.25, na.rm = TRUE),
+    n_dprime_inverse_preference_0.75 = sum(d_prime < -0.75, na.rm = TRUE),
+    n_dprime_inverse_preference_0.60 = sum(d_prime < -0.60, na.rm = TRUE)
+
+  )
+
+training_assessment_SDT_df %>%
+  group_by(session) %>%
+  summarise(
+    n_auc_above_0.50 = sum(AUC >= 0.50, na.rm = TRUE),
+    n_auc_between_0.40_0.60 = sum(AUC >= 0.40 & AUC <= 0.60, na.rm = TRUE),
+    n_auc_below_0.50 = sum(AUC < 0.50, na.rm = TRUE),
+    
+    n_Aprime_above_or_equal_0.5 = sum(A_prime >= 0.5, na.rm = TRUE),
+    n_Aprime_below_0.5 = sum(A_prime < 0.5, na.rm = TRUE),
+    n_Aprime_above_0.75 = sum(A_prime >= 0.75, na.rm = TRUE),
+    n_Aprime_near_chance = sum(A_prime > .4 & A_prime < .6, na.rm = TRUE),
+    
+    n_accuracy_above_or_equal_0.5 = sum(accuracy >= 0.5, na.rm = TRUE),
+    n_accuracy_below_0.5 = sum(accuracy < 0.5, na.rm = TRUE),
+
+    n_dprime_above_0.75 = sum(d_prime > 0.75, na.rm = TRUE),
+    n_dprime_near_chance = sum(d_prime > -.25 & d_prime < +.25, na.rm = TRUE),
+    n_dprime_inverse_preference_0.75 = sum(d_prime < -0.75, na.rm = TRUE),
+    n_dprime_inverse_preference_0.60 = sum(d_prime < -0.60, na.rm = TRUE)
+
+
+  )
+
+training_SDT_df %>%
+  group_by(session) %>%
+  summarise(
+    n_auc_above_0.50 = sum(AUC >= 0.50, na.rm = TRUE),
+    n_auc_between_0.40_0.60 = sum(AUC >= 0.40 & AUC <= 0.60, na.rm = TRUE),
+    n_auc_below_0.50 = sum(AUC < 0.50, na.rm = TRUE),
+    
+    n_Aprime_above_or_equal_0.5 = sum(A_prime >= 0.5, na.rm = TRUE),
+    n_Aprime_below_0.5 = sum(A_prime < 0.5, na.rm = TRUE),
+    n_Aprime_above_0.75 = sum(A_prime >= 0.75, na.rm = TRUE),
+    n_Aprime_near_chance = sum(A_prime > .4 & A_prime < .6, na.rm = TRUE),
+    
+    n_accuracy_above_or_equal_0.5 = sum(accuracy >= 0.5, na.rm = TRUE),
+    n_accuracy_below_0.5 = sum(accuracy < 0.5, na.rm = TRUE),
+
+    n_dprime_above_0.75 = sum(d_prime > 0.75, na.rm = TRUE),
+    n_dprime_near_chance = sum(d_prime > -.25 & d_prime < +.25, na.rm = TRUE),
+    n_dprime_inverse_preference_0.75 = sum(d_prime < -0.75, na.rm = TRUE),
+    n_dprime_inverse_preference_0.60 = sum(d_prime < -0.60, na.rm = TRUE)
+
+  )
+
+```
+
+```{r Using absolute calues of d'}
+# Reviewer 2: what happens to above-chance and near-chance performance when using absolute values of d'?
+
+control_SDT_df$d_prime_abs <- control_SDT_df$d_prime %>% abs()
+training_assessment_SDT_df$d_prime_abs <- training_assessment_SDT_df$d_prime %>% abs()
+training_SDT_df$d_prime_abs <- training_SDT_df$d_prime %>% abs()
+
+control_SDT_df %>%
+  group_by(session) %>%
+  summarise(
+    n_dprime_above_0.75 = sum(d_prime_abs > 0.75, na.rm = TRUE),
+    n_dprime_near_chance = sum(d_prime_abs > -.25 & d_prime_abs < +.25, na.rm = TRUE),
+    n_dprime_inverse_preference_0.75 = sum(d_prime_abs < -0.75, na.rm = TRUE),
+    n_dprime_inverse_preference_0.60 = sum(d_prime_abs < -0.60, na.rm = TRUE)
+
+  )
+
+training_assessment_SDT_df %>%
+  group_by(session) %>%
+  summarise(
+    n_dprime_above_0.75 = sum(d_prime_abs > 0.75, na.rm = TRUE),
+    n_dprime_near_chance = sum(d_prime_abs > -.25 & d_prime_abs < +.25, na.rm = TRUE),
+    n_dprime_inverse_preference_0.75 = sum(d_prime_abs < -0.75, na.rm = TRUE),
+    n_dprime_inverse_preference_0.60 = sum(d_prime_abs < -0.60, na.rm = TRUE)
+  )
+
+training_SDT_df %>%
+  group_by(session) %>%
+  summarise(
+    n_dprime_above_0.75 = sum(d_prime_abs > 0.75, na.rm = TRUE),
+    n_dprime_near_chance = sum(d_prime_abs > -.25 & d_prime_abs < +.25, na.rm = TRUE),
+    n_dprime_inverse_preference_0.75 = sum(d_prime_abs < -0.75, na.rm = TRUE),
+    n_dprime_inverse_preference_0.60 = sum(d_prime_abs < -0.60, na.rm = TRUE)
+
+  )
+```
+
+
+```{r Simple chance}
+
+sum(control_SDT_df$AUC > 0.50)
+sum(control_SDT_df$AUC >= 0.40 & control_SDT_df$AUC <= 0.60)
+sum(control_SDT_df$AUC < 0.50)
+
+```
+
+# Supplementary 1.1: Comparing heartrate during training pre- vs. post-physical activity
+
+```{r Density plot pre- vs. post-physical activity}
+
+# Group by Participant and condition, compute mean HR (in beats per minute)
+mean_hr_df <- training_df %>%
+  group_by(Participant, isExercise) %>%
+  summarise(mean_hr = mean(heartRate, na.rm = TRUE), .groups = "drop")
+
+# Calculate mean interbeat interval (in milliseconds between beats)
+mean_IBI_df <- mean_hr_df %>%
+  transmute(Participant,
+            isExercise,
+            mean_IBI_ms = 60000 / mean_hr)
+
+# Rename isExercise column for plotting
+mean_hr_df <- mean_hr_df %>%
+  mutate(isExercise = factor(isExercise, 
+                             levels = c(0, 1), 
+                             labels = c("pre-activity", "post-activity")))
+mean_IBI_df <- mean_IBI_df %>%
+  mutate(isExercise = factor(isExercise, 
+                             levels = c(0, 1), 
+                             labels = c("pre-activity", "post-activity")))
+
+# Density plot heartrate (BPM)
+ggplot(mean_hr_df, aes(x = mean_hr, fill = isExercise)) +
+  geom_density(alpha = 0.6) +
+  labs(x = "Mean Heartrate", 
+       y = "Density", 
+       fill = "Physical Activity Condition") +
+  scale_fill_manual(values = c("pre-activity" = "grey70", 
+                               "post-activity" = "lightcoral")) +
+  theme_minimal()
+
+ggplot(mean_IBI_df, aes(x = mean_IBI_ms, fill = isExercise)) +
+  geom_density(alpha = 0.6) +
+  geom_vline(xintercept = 250, linetype = "dashed", color = "black") +
+  geom_vline(xintercept = 550, linetype = "dashed", color = "black") +
+  annotate("text", x = 250, y = 0.002, label = "250ms", angle = 90, vjust = -0.5) +
+  annotate("text", x = 550, y = 0.002, label = "550ms", angle = 90, vjust = -0.5) +
+  labs(x = "Mean Interbeat Interval (ms)", 
+       y = "Density", 
+       fill = "Physical Activity Condition") +
+  scale_fill_manual(values = c("pre-activity" = "grey70", 
+                               "post-activity" = "lightcoral")) +
+  coord_cartesian(xlim = c(0, 1100)) +
+  theme_minimal()
+
+# Interbeat interval plot
+ggsave(
+  filename = "density_mean_IBI.png",
+  width = 7, height = 5, units = "in",
+  dpi = 300
+)
+
+```
+Heartrate does not significantly differ during the pre- vs. post- physical activity
+```{r t-test comparing HR in pre- vs. post-physical activity}
+
+# Wide format: one row per Participant, columns for pre and post
+wide_hr <- mean_hr_df %>%
+  tidyr::pivot_wider(names_from = isExercise,
+                     values_from = mean_hr,
+                     names_prefix = "cond_")
+
+# Paired t-test
+t.test(mean_hr ~ isExercise, data = mean_hr_df, paired = TRUE)
+
+```
+
+```{r LME pre- vs. post-activity HR, with random effects}
+
+temp_df <- training_df %>%
+  mutate(
+    Participant = factor(Participant),
+    day = factor(day),
+    isExercise = factor(isExercise, levels = c(0, 1), labels = c("pre", "post"))
+  )
+
+temp_df <- temp_df %>% merge(df %>% filter(Condition=='active') %>% dplyr::select(Participant, Age, Sex))
+
+
+# Random intercepts for Participant
+lmm1 <- lmer(heartRate ~ isExercise + Age + Sex + (1 | Participant), data = temp_df)
+
+# Include random intercepts for Participant and day
+lmm2 <- lmer(heartRate ~ isExercise + Age + Sex + (1 | Participant) + (1 | day), data = temp_df)
+
+# Include random slopes for exercise within participants:
+lmm3 <- lmer(heartRate ~ isExercise + Age + Sex + (1 + isExercise | Participant), data = temp_df)
+
+lmm4 <- lmer(heartRate ~ isExercise + Age + Sex + (1 + isExercise | Participant) + (1 | day), data = temp_df)
+
+anova(lmm1, lmm2)
+
+anova(lmm1, lmm3)
+
+anova(lmm3, lmm4)
+
+summary(lmm4)
+
+# library(lmerTest)
+library(sjPlot)
+tab_model(lmm4, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+```
+
+# Test-retest reliability for conventional task measures
+
+## Hearbeat discrimination accuracy
+```{r}
+library(tidyr)
+library(dplyr)
+library(psych)
+
+# Pivot to wide format
+accuracy_wide <- control_SDT_df %>%
+  dplyr::select(Participant, session, accuracy) %>%
+  pivot_wider(names_from = session, values_from = accuracy, names_prefix = "session_")
+
+dprime_wide <- control_SDT_df %>%
+  dplyr::select(Participant, session, d_prime) %>%
+  pivot_wider(names_from = session, values_from = d_prime, names_prefix = "session_")
+
+# Remove rows with any missing values
+accuracy_wide_clean <- accuracy_wide %>% drop_na()
+dprime_wide_clean <- dprime_wide %>% drop_na()
+
+# Compute ICC for accuracy
+icc_accuracy <- ICC(accuracy_wide_clean %>% dplyr::select(starts_with("session_")))
+print(icc_accuracy)
+
+# Compute ICC for d_prime
+icc_dprime <- ICC(dprime_wide_clean %>% dplyr::select(starts_with("session_")))
+print(icc_dprime)
+
+```
+
+## Heartbeat counting accuracy
+
+```{r HCT ICC control}
+library(dplyr)
+library(psych)
+
+control_HCT_df <- read.csv("data/data.csv") %>%
+  filter(Condition == "control") %>%
+  dplyr::select(HBT_BL, HBT_Mid, HBT_FL)
+
+# Calculate ICC using psych::ICC
+icc_results <- ICC(control_HCT_df)
+
+print(icc_results)
+
+```
+
+```{r HCT ICC training}
+library(dplyr)
+library(psych)
+
+training_HCT_df <- read.csv("data/data.csv") %>%
+  filter(Condition == "active") %>%
+  dplyr::select(HBT_BL, HBT_Mid, HBT_FL)
+
+# Calculate ICC using psych::ICC
+icc_results <- ICC(training_HCT_df)
+print(icc_results)
+
+```
+
+# Supplementary 8.3: does anxiety reduction simply relate to getting more positive feedback from correct trials?
+
+```{r Import data, calculate mean correct trials}
+df <- read.csv("data/data.csv")
+
+# Append 'C' to participant numbers in control group
+df$Participant <- ifelse(df$Condition == "control", paste0(df$Participant, "C"), df$Participant)
+
+library(dplyr)
+
+accuracy_df <- training_df %>%
+  mutate(isCorrect = if_else(inSync == response, 1, 0)) %>%
+  group_by(Participant) %>%
+  summarise(mean_isCorrect = mean(isCorrect), .groups = "drop") %>%
+  mutate(Participant = as.character(Participant))
+
+
+temp_df <- accuracy_df %>%
+  left_join(
+    df %>%
+      dplyr::select(Participant, State_BL, Trait_BL, StateAnxietyChange_FmB, TraitAnxietyChange_FmB, Age, Sex),  # 👈 specify columns here
+    by = c("Participant")
+  )
+
+```
+
+```{r LME to predict change in state anxiety}
+model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + State_BL + mean_isCorrect + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+```{r LME to predict change in trait anxiety}
+model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + Trait_BL + mean_isCorrect + Age + Sex + (1 | Sex), 
+               data    = temp_df)
+
+library(sjPlot)
+tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+print("----------------------- Normality of residuals -----------------------")
+
+# Obtain the residuals from the model
+residuals <- residuals(model)
+
+# Perform a Shapiro-Wilk test for normality
+shapiro_test <- shapiro.test(residuals)
+
+cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
+
+# Check VIFs for multicollinearity
+vifs <- vif(model)
+cat("Variance inflation factors:\n")
+vifs <- round(vifs, 2)
+cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
+
+
+# Plot a Q-Q plot of the residuals
+qqnorm(residuals)
+qqline(residuals)
+```
+
+
