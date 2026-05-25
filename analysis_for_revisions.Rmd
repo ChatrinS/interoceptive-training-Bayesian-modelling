@@ -1,28 +1,43 @@
 ---
-title: "R Notebook"
+title: "Analysis for revision"
 output: html_notebook
 ---
 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
 ```{r}
-library(tidyverse)
-library(lavaan)
 library(dplyr)
 library(tidyr)
+library(tidyverse)
+
 library(ggplot2)
 library(lme4)
 library(lmerTest)
+library(sjPlot)
+library(psych)
+library(car)
+
 ```
 
 
 # Import training group training data, and control group assessment trial-by-trial data for heartbeat discrimination task
 
-```{r}
+```{r Import trial by trial data from training group}
 df <- read.csv("data/data.csv")
 data_path <- "./data/processed/"
 csv_files <- list.files(path = data_path, pattern = "\\.csv$", full.names = TRUE)
 data_list <- csv_files %>%
   set_names(~ tools::file_path_sans_ext(basename(.x))) %>%
-  map(read_csv)
+  map(read_csv, show_col_types = FALSE)
+
+
+# Check number of trials for each training participant
 row_counts <- map_int(data_list, nrow)
 print(row_counts)
 
@@ -30,9 +45,7 @@ print(row_counts)
 
 
 
-```{r}
-
-library(tidyverse)
+```{r Wrangle training group}
 
 training_df <- imap_dfr(data_list, ~ mutate(.x)) # , participant = .y
 
@@ -62,23 +75,24 @@ head(training_df)
 ```
 
 
-```{r}
+```{r Import trial by trial data from control group}
+
 data_path <- "./data/assessment/control/"
 csv_files <- list.files(path = data_path, pattern = "\\.csv$", full.names = TRUE)
 data_list <- csv_files %>%
   set_names(~ tools::file_path_sans_ext(basename(.x))) %>%
-  map(read_csv)
-row_counts <- map_int(data_list, nrow)
+  map(read_csv, show_col_types = FALSE)
 
+
+row_counts <- map_int(data_list, nrow)
 print(row_counts)
 
 ```
 
 
 
-```{r}
+```{r Wrangle control group}
 
-library(tidyverse)
 
 control_df <- imap_dfr(data_list, ~ mutate(.x)) # , participant = .y
 
@@ -107,12 +121,12 @@ head(control_df)
 
 ```
 
-```{r}
+```{r Import and wrangle training group assessment data}
 data_path <- "./data/assessment/training/"
 csv_files <- list.files(path = data_path, pattern = "\\.csv$", full.names = TRUE)
 data_list <- csv_files %>%
   set_names(~ tools::file_path_sans_ext(basename(.x))) %>%
-  map(read_csv)
+  map(read_csv, show_col_types = FALSE)
 row_counts <- map_int(data_list, nrow)
 
 print(row_counts)
@@ -146,7 +160,6 @@ head(training_assessment_df)
 
 
 ```{r Calculate summary: overall response bias, overall accuracy}
-library(dplyr)
 
 summary_training_df <- training_df %>%
   group_by(Participant) %>%
@@ -183,17 +196,6 @@ sum(summary_control_df$mean_response < 0.5) %>% print()
 sum(summary_control_df$mean_accuracy < 0.5) %>% print()
 
 
-
-```
-
-
-```{r}
-ggplot(summary_training_df, aes(x = mean_response)) +
-  geom_density(fill = "steelblue", alpha = 0.6) +
-  labs(title = "Density of Mean Response",
-       x = "Mean Response",
-       y = "Density") +
-  theme_minimal()
 
 ```
 
@@ -243,8 +245,7 @@ control_SDT_df <- control_df %>%
 
 ```
 
-```{r}
-library(dplyr)
+```{r Calculate signal detection theory metrics}
 
 calculate_SDT_metrics <- function(df) {
   df %>%
@@ -402,15 +403,6 @@ training_SDT_df %>%
   )
 ```
 
-
-```{r Simple chance}
-
-sum(control_SDT_df$AUC > 0.50)
-sum(control_SDT_df$AUC >= 0.40 & control_SDT_df$AUC <= 0.60)
-sum(control_SDT_df$AUC < 0.50)
-
-```
-
 # Supplementary 1.1: Comparing heartrate during training pre- vs. post-physical activity
 
 ```{r Density plot pre- vs. post-physical activity}
@@ -436,16 +428,17 @@ mean_IBI_df <- mean_IBI_df %>%
                              levels = c(0, 1), 
                              labels = c("pre-activity", "post-activity")))
 
-# Density plot heartrate (BPM)
-ggplot(mean_hr_df, aes(x = mean_hr, fill = isExercise)) +
-  geom_density(alpha = 0.6) +
-  labs(x = "Mean Heartrate", 
-       y = "Density", 
-       fill = "Physical Activity Condition") +
-  scale_fill_manual(values = c("pre-activity" = "grey70", 
-                               "post-activity" = "lightcoral")) +
-  theme_minimal()
+# # Density plot heartrate (BPM)
+# ggplot(mean_hr_df, aes(x = mean_hr, fill = isExercise)) +
+#   geom_density(alpha = 0.6) +
+#   labs(x = "Mean Heartrate", 
+#        y = "Density", 
+#        fill = "Physical Activity Condition") +
+#   scale_fill_manual(values = c("pre-activity" = "grey70", 
+#                                "post-activity" = "lightcoral")) +
+#   theme_minimal()
 
+# Density plot for interbeat interval (IBI)
 ggplot(mean_IBI_df, aes(x = mean_IBI_ms, fill = isExercise)) +
   geom_density(alpha = 0.6) +
   geom_vline(xintercept = 250, linetype = "dashed", color = "black") +
@@ -460,7 +453,7 @@ ggplot(mean_IBI_df, aes(x = mean_IBI_ms, fill = isExercise)) +
   coord_cartesian(xlim = c(0, 1100)) +
   theme_minimal()
 
-# Interbeat interval plot
+# Save figure
 ggsave(
   filename = "density_mean_IBI.png",
   width = 7, height = 5, units = "in",
@@ -468,7 +461,9 @@ ggsave(
 )
 
 ```
-Heartrate does not significantly differ during the pre- vs. post- physical activity
+
+
+Heart rate does not significantly differ during the pre- vs. post- physical activity trials
 ```{r t-test comparing HR in pre- vs. post-physical activity}
 
 # Wide format: one row per Participant, columns for pre and post
@@ -513,49 +508,42 @@ anova(lmm3, lmm4)
 
 summary(lmm4)
 
-# library(lmerTest)
-library(sjPlot)
-tab_model(lmm4, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
+
+
+# Careful, this takes a long time to run!
+# tab_model(lmm4, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
 
 ```
 
 # Test-retest reliability for conventional task measures
 
-## Hearbeat discrimination accuracy
+## Hearbeat discrimination 
 ```{r}
-library(tidyr)
-library(dplyr)
-library(psych)
 
-# Pivot to wide format
+# Pivot to wide format, remove missing values
 accuracy_wide <- control_SDT_df %>%
   dplyr::select(Participant, session, accuracy) %>%
   pivot_wider(names_from = session, values_from = accuracy, names_prefix = "session_")
-
 dprime_wide <- control_SDT_df %>%
   dplyr::select(Participant, session, d_prime) %>%
   pivot_wider(names_from = session, values_from = d_prime, names_prefix = "session_")
 
-# Remove rows with any missing values
 accuracy_wide_clean <- accuracy_wide %>% drop_na()
 dprime_wide_clean <- dprime_wide %>% drop_na()
 
-# Compute ICC for accuracy
+# ICC for accuracy
 icc_accuracy <- ICC(accuracy_wide_clean %>% dplyr::select(starts_with("session_")))
 print(icc_accuracy)
 
-# Compute ICC for d_prime
+# ICC for d_prime
 icc_dprime <- ICC(dprime_wide_clean %>% dplyr::select(starts_with("session_")))
 print(icc_dprime)
 
 ```
 
-## Heartbeat counting accuracy
+## Heartbeat counting 
 
 ```{r HCT ICC control}
-library(dplyr)
-library(psych)
-
 control_HCT_df <- read.csv("data/data.csv") %>%
   filter(Condition == "control") %>%
   dplyr::select(HBT_BL, HBT_Mid, HBT_FL)
@@ -568,14 +556,12 @@ print(icc_results)
 ```
 
 ```{r HCT ICC training}
-library(dplyr)
-library(psych)
 
 training_HCT_df <- read.csv("data/data.csv") %>%
   filter(Condition == "active") %>%
   dplyr::select(HBT_BL, HBT_Mid, HBT_FL)
 
-# Calculate ICC using psych::ICC
+# Calculate ICC
 icc_results <- ICC(training_HCT_df)
 print(icc_results)
 
@@ -586,10 +572,9 @@ print(icc_results)
 ```{r Import data, calculate mean correct trials}
 df <- read.csv("data/data.csv")
 
-# Append 'C' to participant numbers in control group
+# Harmonise participant identifiers
 df$Participant <- ifelse(df$Condition == "control", paste0(df$Participant, "C"), df$Participant)
 
-library(dplyr)
 
 accuracy_df <- training_df %>%
   mutate(isCorrect = if_else(inSync == response, 1, 0)) %>%
@@ -610,16 +595,16 @@ temp_df <- accuracy_df %>%
 ```{r LME to predict change in state anxiety}
 model <- lmer(formula = StateAnxietyChange_FmB ~ 1 + State_BL + mean_isCorrect + Age + Sex + (1 | Sex), 
                data    = temp_df)
-library(sjPlot)
+
 tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
 
 
 print("----------------------- Normality of residuals -----------------------")
 
-# Obtain the residuals from the model
+# Residuals from the model
 residuals <- residuals(model)
 
-# Perform a Shapiro-Wilk test for normality
+# Shapiro-Wilk test for normality
 shapiro_test <- shapiro.test(residuals)
 
 cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
@@ -631,7 +616,7 @@ vifs <- round(vifs, 2)
 cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
 
 
-# Plot a Q-Q plot of the residuals
+# Q-Q plot of the residuals
 qqnorm(residuals)
 qqline(residuals)
 ```
@@ -640,15 +625,14 @@ qqline(residuals)
 model <- lmer(formula = TraitAnxietyChange_FmB ~ 1 + Trait_BL + mean_isCorrect + Age + Sex + (1 | Sex), 
                data    = temp_df)
 
-library(sjPlot)
 tab_model(model, show.ci = FALSE, show.se = TRUE, show.df = TRUE, p.val = "kr", show.stat = TRUE)
 
 print("----------------------- Normality of residuals -----------------------")
 
-# Obtain the residuals from the model
+# Residuals from the model
 residuals <- residuals(model)
 
-# Perform a Shapiro-Wilk test for normality
+# Shapiro-Wilk test for normality
 shapiro_test <- shapiro.test(residuals)
 
 cat("Shapiro-Wilk statistic =", round(shapiro_test$statistic, 2), ", p-value =", round(shapiro_test$p.value, 2), "\n")
@@ -660,7 +644,7 @@ vifs <- round(vifs, 2)
 cat(paste(names(vifs), vifs, sep = ": ", collapse = ";  "))
 
 
-# Plot a Q-Q plot of the residuals
+# Q-Q plot of the residuals
 qqnorm(residuals)
 qqline(residuals)
 ```
